@@ -86,6 +86,8 @@ import {
 } from './server-interceptors';
 import { PartialStatusObject } from './call-interface';
 import { CallEventTracker } from './transport';
+// @ts-expect-error no types
+import * as reusifyFactory from 'reusify';
 
 const UNLIMITED_CONNECTION_AGE_MS = ~(1 << 31);
 const KEEPALIVE_MAX_TIME_MS = ~(1 << 31);
@@ -95,6 +97,14 @@ const MAX_CONNECTION_IDLE_MS = ~(1 << 31);
 const { HTTP2_HEADER_PATH } = http2.constants;
 
 const TRACER_NAME = 'server';
+const kMaxAge = Buffer.from('max_age');
+
+const sessionCtxFactory: Reusify<SessionCtx> = reusifyFactory(SessionCtx);
+
+interface Reusify<T> {
+  get(): T;
+  release(obj: T): void;
+}
 
 type AnyHttp2Server = http2.Http2Server | http2.Http2SecureServer;
 
@@ -187,6 +197,48 @@ interface ChannelzSessionInfo {
   keepAlivesSent: number;
   lastMessageSentTimestamp: Date | null;
   lastMessageReceivedTimestamp: Date | null;
+}
+
+/**
+ * Contains http2session context information
+ */
+interface SessionCtx {
+  // required by reusify
+  next: null | SessionCtx;
+  // Tracks whether the connection is closed by server
+  sessionClosedByServer: boolean;
+  // Connection Max Age Timeout if enabled
+  connectionAgeTimer: NodeJS.Timeout | null;
+  // Connection Max Age grace close timer
+  connectionAgeGraceTimer: NodeJS.Timeout | null;
+  // Session Idle Timeout  if enabled
+  idleTimeoutObj: SessionIdleTimeoutTracker | null;
+  // Keepalive Interval Timeout
+  keeapliveTimeTimer: NodeJS.Timeout | null;
+  // timeout for .ping() to return response
+  pingTimeoutTimer: NodeJS.Timeout | null;
+  // contains current client addr
+  clientAddress: string;
+  // Channelz Debug Info
+  channelzRef: SocketRef | null;
+
+  // refs to servers
+  server: Server;
+  http2Server: http2.Http2Server;
+
+  // needs to be called when session is being closed
+  onClose(): void;
+
+  // handles session.ping responses
+  onPingResponse(
+    this: http2.ServerHttp2Session,
+    err: Error | null,
+    duration: number,
+    payload: Buffer
+  ): void;
+
+  // handles when .ping() call doesn't return in time
+  onPingTimeout(this: http2.ServerHttp2Session): void;
 }
 
 /**
@@ -1004,7 +1056,7 @@ export class Server {
       for (const session of allSessions) {
         session.destroy(http2.constants.NGHTTP2_CANCEL as any);
       }
-    }, graceTimeMs).unref();
+    }, graceTimeMs).unref?.();
   }
 
   forceShutdown(): void {
@@ -1377,103 +1429,18 @@ export class Server {
     return (session: http2.ServerHttp2Session) => {
       this.http2Servers.get(http2Server)?.sessions.add(session);
 
-      let connectionAgeTimer: NodeJS.Timeout | null = null;
-      let connectionAgeGraceTimer: NodeJS.Timeout | null = null;
-      let keeapliveTimeTimer: NodeJS.Timeout | null = null;
-      let sessionClosedByServer = false;
+      const clientAddress = `${session.socket.remoteAddress}:${session.socket.remotePort}`;
+      const ctx = sessionCtxFactory.get();
 
-      const idleTimeoutObj = this.enableIdleTimeout(session);
+      ctx.http2Server = http2Server;
+      ctx.server = this;
+      ctx.clientAddress = clientAddress;
 
-      if (this.maxConnectionAgeMs !== UNLIMITED_CONNECTION_AGE_MS) {
-        // Apply a random jitter within a +/-10% range
-        const jitterMagnitude = this.maxConnectionAgeMs / 10;
-        const jitter = Math.random() * jitterMagnitude * 2 - jitterMagnitude;
+      this.enableIdleTimeout(session, ctx);
+      this.enabledMaxAgeTimeout(session, ctx);
+      this.enableKeepaliveTimeout(session, ctx, null);
 
-        connectionAgeTimer = setTimeout(() => {
-          sessionClosedByServer = true;
-
-          this.trace(
-            'Connection dropped by max connection age: ' +
-              session.socket?.remoteAddress
-          );
-
-          try {
-            session.goaway(
-              http2.constants.NGHTTP2_NO_ERROR,
-              ~(1 << 31),
-              Buffer.from('max_age')
-            );
-          } catch (e) {
-            // The goaway can't be sent because the session is already closed
-            session.destroy();
-            return;
-          }
-          session.close();
-
-          /* Allow a grace period after sending the GOAWAY before forcibly
-           * closing the connection. */
-          if (this.maxConnectionAgeGraceMs !== UNLIMITED_CONNECTION_AGE_MS) {
-            connectionAgeGraceTimer = setTimeout(() => {
-              session.destroy();
-            }, this.maxConnectionAgeGraceMs).unref();
-          }
-        }, this.maxConnectionAgeMs + jitter).unref();
-      }
-
-      if (this.keepaliveTimeMs < KEEPALIVE_MAX_TIME_MS) {
-        keeapliveTimeTimer = setInterval(() => {
-          const timeoutTimer = setTimeout(() => {
-            sessionClosedByServer = true;
-            session.close();
-          }, this.keepaliveTimeoutMs).unref();
-
-          try {
-            session.ping(
-              (err: Error | null, duration: number, payload: Buffer) => {
-                clearTimeout(timeoutTimer);
-
-                if (err) {
-                  sessionClosedByServer = true;
-                  this.trace(
-                    `Connection dropped due to error of a ping frame ${err.message} return in ${duration}`
-                  );
-                  session.close();
-                }
-              }
-            );
-          } catch (e) {
-            // The ping can't be sent because the session is already closed
-            session.destroy();
-          }
-        }, this.keepaliveTimeMs).unref();
-      }
-
-      session.on('close', () => {
-        if (!sessionClosedByServer) {
-          this.trace(
-            `Connection dropped by client ${session.socket?.remoteAddress}`
-          );
-        }
-
-        if (connectionAgeTimer) {
-          clearTimeout(connectionAgeTimer);
-        }
-
-        if (connectionAgeGraceTimer) {
-          clearTimeout(connectionAgeGraceTimer);
-        }
-
-        if (keeapliveTimeTimer) {
-          clearTimeout(keeapliveTimeTimer);
-        }
-
-        if (idleTimeoutObj !== null) {
-          clearTimeout(idleTimeoutObj.timeout);
-          this.sessionIdleTimeouts.delete(session);
-        }
-
-        this.http2Servers.get(http2Server)?.sessions.delete(session);
-      });
+      session.on('close', ctx.onClose);
     };
   }
 
@@ -1489,9 +1456,7 @@ export class Server {
 
       const channelzSessionInfo: ChannelzSessionInfo = {
         ref: channelzRef,
-        streamTracker: this.channelzEnabled
-          ? new ChannelzCallTracker()
-          : new ChannelzCallTrackerStub(),
+        streamTracker: new ChannelzCallTracker(),
         messagesSent: 0,
         messagesReceived: 0,
         keepAlivesSent: 0,
@@ -1510,138 +1475,154 @@ export class Server {
       this.trace('Connection established by client ' + clientAddress);
       this.sessionChildrenTracker.refChild(channelzRef);
 
-      let connectionAgeTimer: NodeJS.Timeout | null = null;
-      let connectionAgeGraceTimer: NodeJS.Timeout | null = null;
-      let keeapliveTimeTimer: NodeJS.Timeout | null = null;
-      let sessionClosedByServer = false;
+      const ctx = sessionCtxFactory.get();
 
-      const idleTimeoutObj = this.enableIdleTimeout(session);
+      ctx.clientAddress = clientAddress;
+      ctx.http2Server = http2Server;
+      ctx.server = this;
 
-      if (this.maxConnectionAgeMs !== UNLIMITED_CONNECTION_AGE_MS) {
-        // Apply a random jitter within a +/-10% range
-        const jitterMagnitude = this.maxConnectionAgeMs / 10;
-        const jitter = Math.random() * jitterMagnitude * 2 - jitterMagnitude;
+      this.enableIdleTimeout(session, ctx);
+      this.enabledMaxAgeTimeout(session, ctx);
+      this.enableKeepaliveTimeout(session, ctx, channelzSessionInfo);
 
-        connectionAgeTimer = setTimeout(() => {
-          sessionClosedByServer = true;
-          this.channelzTrace.addTrace(
-            'CT_INFO',
-            'Connection dropped by max connection age from ' + clientAddress
-          );
-
-          try {
-            session.goaway(
-              http2.constants.NGHTTP2_NO_ERROR,
-              ~(1 << 31),
-              Buffer.from('max_age')
-            );
-          } catch (e) {
-            // The goaway can't be sent because the session is already closed
-            session.destroy();
-            return;
-          }
-          session.close();
-
-          /* Allow a grace period after sending the GOAWAY before forcibly
-           * closing the connection. */
-          if (this.maxConnectionAgeGraceMs !== UNLIMITED_CONNECTION_AGE_MS) {
-            connectionAgeGraceTimer = setTimeout(() => {
-              session.destroy();
-            }, this.maxConnectionAgeGraceMs).unref();
-          }
-        }, this.maxConnectionAgeMs + jitter).unref();
-      }
-
-      if (this.keepaliveTimeMs < KEEPALIVE_MAX_TIME_MS) {
-        keeapliveTimeTimer = setInterval(() => {
-          const timeoutTImer = setTimeout(() => {
-            sessionClosedByServer = true;
-            this.channelzTrace.addTrace(
-              'CT_INFO',
-              'Connection dropped by keepalive timeout from ' + clientAddress
-            );
-
-            session.close();
-          }, this.keepaliveTimeoutMs).unref();
-          try {
-            session.ping(
-              (err: Error | null, duration: number, payload: Buffer) => {
-                clearTimeout(timeoutTImer);
-
-                if (err) {
-                  sessionClosedByServer = true;
-                  this.channelzTrace.addTrace(
-                    'CT_INFO',
-                    'Connection dropped due to error of a ping frame ' +
-                      err.message +
-                      ' return in ' +
-                      duration
-                  );
-
-                  session.close();
-                }
-              }
-            );
-            channelzSessionInfo.keepAlivesSent += 1;
-          } catch (e) {
-            // The ping can't be sent because the session is already closed
-            session.destroy();
-          }
-        }, this.keepaliveTimeMs).unref();
-      }
-
-      session.on('close', () => {
-        if (!sessionClosedByServer) {
-          this.channelzTrace.addTrace(
-            'CT_INFO',
-            'Connection dropped by client ' + clientAddress
-          );
-        }
-
-        this.sessionChildrenTracker.unrefChild(channelzRef);
-        unregisterChannelzRef(channelzRef);
-
-        if (connectionAgeTimer) {
-          clearTimeout(connectionAgeTimer);
-        }
-
-        if (connectionAgeGraceTimer) {
-          clearTimeout(connectionAgeGraceTimer);
-        }
-
-        if (keeapliveTimeTimer) {
-          clearTimeout(keeapliveTimeTimer);
-        }
-
-        if (idleTimeoutObj !== null) {
-          clearTimeout(idleTimeoutObj.timeout);
-          this.sessionIdleTimeouts.delete(session);
-        }
-
-        this.http2Servers.get(http2Server)?.sessions.delete(session);
-        this.sessions.delete(session);
-      });
+      session.on('close', ctx.onClose);
     };
   }
 
-  private enableIdleTimeout(
-    session: http2.ServerHttp2Session
-  ): SessionIdleTimeoutTracker | null {
-    if (this.sessionIdleTimeout >= MAX_CONNECTION_IDLE_MS) {
-      return null;
+  // Http2Session max age timers
+  private enabledMaxAgeTimeout(
+    session: http2.ServerHttp2Session,
+    ctx: SessionCtx
+  ): void {
+    if (this.maxConnectionAgeMs >= UNLIMITED_CONNECTION_AGE_MS) {
+      return;
     }
 
+    // Apply a random jitter within a +/-10% range
+    const jitterMagnitude = this.maxConnectionAgeMs / 10;
+    const jitter = Math.random() * jitterMagnitude * 2 - jitterMagnitude;
+    const connectionAgeTimer = setTimeout(
+      this.onMaxAgeTimeout,
+      this.maxConnectionAgeMs + jitter,
+      this,
+      session,
+      ctx
+    );
+    ctx.connectionAgeTimer = connectionAgeTimer;
+    connectionAgeTimer.unref?.();
+  }
+
+  private onMaxAgeTimeout(
+    this: undefined,
+    server: Server,
+    session: http2.ServerHttp2Session,
+    ctx: SessionCtx
+  ): void {
+    ctx.sessionClosedByServer = true;
+
+    server.trace(
+      'Connection dropped by max connection age: ' +
+        session.socket?.remoteAddress
+    );
+
+    try {
+      session.goaway(http2.constants.NGHTTP2_NO_ERROR, ~(1 << 31), kMaxAge);
+    } catch (e) {
+      // The goaway can't be sent because the session is already closed
+      session.destroy();
+      return;
+    }
+    session.close();
+
+    /* Allow a grace period after sending the GOAWAY before forcibly
+     * closing the connection. */
+    if (server.maxConnectionAgeGraceMs !== UNLIMITED_CONNECTION_AGE_MS) {
+      const connectionAgeGraceTimer = setTimeout(() => {
+        session.destroy();
+      }, server.maxConnectionAgeGraceMs);
+
+      connectionAgeGraceTimer.unref?.();
+      ctx.connectionAgeGraceTimer = connectionAgeGraceTimer;
+    }
+  }
+
+  // Http2Session keepalive timers
+  private enableKeepaliveTimeout(
+    session: http2.ServerHttp2Session,
+    ctx: SessionCtx,
+    channelzSessionInfo: ChannelzSessionInfo | null
+  ): void {
+    if (this.keepaliveTimeMs >= KEEPALIVE_MAX_TIME_MS) {
+      ctx.keeapliveTimeTimer = null;
+      return;
+    }
+
+    const keeapliveTimeTimer = setInterval(
+      this.onKeepAliveInterval,
+      this.keepaliveTimeMs,
+      this,
+      session,
+      ctx,
+      channelzSessionInfo
+    );
+
+    ctx.keeapliveTimeTimer = keeapliveTimeTimer;
+    keeapliveTimeTimer.unref?.();
+  }
+
+  private onKeepAliveInterval(
+    this: unknown,
+    server: Server,
+    session: http2.ServerHttp2Session,
+    ctx: SessionCtx,
+    channelzSessionInfo: ChannelzSessionInfo | null
+  ): void {
+    const pingTimeoutTimer = setTimeout(
+      ctx.onPingTimeout,
+      server.keepaliveTimeoutMs
+    );
+    pingTimeoutTimer.unref?.();
+    ctx.pingTimeoutTimer = pingTimeoutTimer;
+
+    try {
+      session.ping(ctx.onPingResponse);
+
+      if (channelzSessionInfo !== null) {
+        channelzSessionInfo.keepAlivesSent += 1;
+      }
+    } catch (e) {
+      clearTimeout(pingTimeoutTimer);
+
+      // The ping can't be sent because the session is already closed
+      session.destroy();
+    }
+  }
+
+  // Http2Session connection idle timeout
+  private enableIdleTimeout(
+    session: http2.ServerHttp2Session,
+    ctx: SessionCtx
+  ): void {
+    if (this.sessionIdleTimeout >= MAX_CONNECTION_IDLE_MS) {
+      ctx.idleTimeoutObj = null;
+      return;
+    }
+
+    const timeout = setTimeout(
+      this.onIdleTimeout,
+      this.sessionIdleTimeout,
+      this,
+      session
+    );
     const idleTimeoutObj: SessionIdleTimeoutTracker = {
       activeStreams: 0,
       lastIdle: Date.now(),
       onClose: this.onStreamClose.bind(this, session),
-      timeout: setTimeout(
-        this.onIdleTimeout,
-        this.sessionIdleTimeout,
-        this,
-        session
-      ).unref(),
+      timeout,
     };
+    timeout.unref?.();
+    ctx.idleTimeoutObj = idleTimeoutObj;
+
     this.sessionIdleTimeouts.set(session, idleTimeoutObj);
 
     const { socket } = session;
@@ -1651,24 +1632,14 @@ export class Server {
         ':' +
         socket.remotePort
     );
-
-    return idleTimeoutObj;
   }
 
   private onIdleTimeout(
     this: undefined,
-    ctx: Server,
+    server: Server,
     session: http2.ServerHttp2Session
   ) {
-    const { socket } = session;
-    ctx.trace(
-      'Session idle timeout checkpoint for ' +
-        socket?.remoteAddress +
-        ':' +
-        socket?.remotePort
-    );
-
-    const sessionInfo = ctx.sessionIdleTimeouts.get(session);
+    const sessionInfo = server.sessionIdleTimeouts.get(session);
 
     // if it is called while we have activeStreams - timer will not be rescheduled
     // until last active stream is closed, then it will call .refresh() on the timer
@@ -1677,12 +1648,21 @@ export class Server {
     if (
       sessionInfo !== undefined &&
       sessionInfo.activeStreams === 0 &&
-      Date.now() - sessionInfo.lastIdle >= ctx.sessionIdleTimeout
+      Date.now() - sessionInfo.lastIdle >= server.sessionIdleTimeout
     ) {
-      ctx.closeSession(session);
+      const { socket } = session;
+      server.trace(
+        'Session idle timeout triggered for ' +
+          socket?.remoteAddress +
+          ':' +
+          socket?.remotePort
+      );
+
+      server.closeSession(session);
     }
   }
 
+  // Http2Stream open/close events
   private onStreamOpened(stream: http2.ServerHttp2Stream) {
     const session = stream.session as http2.ServerHttp2Session;
 
@@ -1939,4 +1919,117 @@ function handleBidiStreaming<RequestType, ResponseType>(
       }
     },
   });
+}
+
+function SessionCtx(this: SessionCtx) {
+  // required by reusify
+  this.next = null;
+  // prepare shape
+  this.connectionAgeGraceTimer = null;
+  this.connectionAgeTimer = null;
+  this.keeapliveTimeTimer = null;
+  this.idleTimeoutObj = null;
+  this.pingTimeoutTimer = null;
+  this.sessionClosedByServer = false;
+  this.clientAddress = '';
+  this.channelzRef = null;
+
+  // @ts-expect-error - creates proper shape
+  this.server = null;
+  // @ts-expect-error - creates proper shape
+  this.http2Server = null;
+
+  // eslint-disable-next-line @typescript-eslint/no-this-alias
+  const that = this;
+
+  /**
+   * Will be called when http2session is closed
+   */
+  this.onClose = function onSessionClose(this: http2.ServerHttp2Session) {
+    const { server, http2Server, channelzRef } = that;
+
+    if (!that.sessionClosedByServer) {
+      // @ts-expect-error - server.trace is just an accessor, ideally would've been `fileprivate`
+      server.trace('Connection dropped by client ' + that.clientAddress);
+    }
+
+    if (that.connectionAgeTimer !== null) {
+      clearTimeout(that.connectionAgeTimer);
+    }
+
+    if (that.connectionAgeGraceTimer !== null) {
+      clearTimeout(that.connectionAgeGraceTimer);
+    }
+
+    if (that.keeapliveTimeTimer !== null) {
+      clearInterval(that.keeapliveTimeTimer);
+    }
+
+    if (that.pingTimeoutTimer !== null) {
+      clearTimeout(that.pingTimeoutTimer);
+    }
+
+    if (that.idleTimeoutObj !== null) {
+      clearTimeout(that.idleTimeoutObj.timeout);
+      // @ts-expect-error - server.http2Servers is just an accessor, ideally would've been `fileprivate`
+      server.sessionIdleTimeouts.delete(this);
+    }
+
+    // @ts-expect-error - server.http2Servers is just an accessor, ideally would've been `fileprivate`
+    server.http2Servers.get(http2Server)?.sessions.delete(this);
+
+    // channelz specific code
+    if (channelzRef) {
+      // @ts-expect-error - server.sessionChildrenTracker private accessor
+      server.sessionChildrenTracker.unrefChild(channelzRef);
+      unregisterChannelzRef(channelzRef);
+
+      // @ts-expect-error - server.sessions private accessor
+      server.sessions.delete(this);
+      that.channelzRef = null;
+    }
+
+    // reset prop and release obj back into the pool
+    that.sessionClosedByServer = false;
+
+    sessionCtxFactory.release(that);
+  };
+
+  this.onPingResponse = function onPingResponse(
+    this: http2.ServerHttp2Session,
+    err: Error | null,
+    duration: number,
+    payload: Buffer
+  ) {
+    const { pingTimeoutTimer } = that;
+    if (pingTimeoutTimer) {
+      clearTimeout(pingTimeoutTimer);
+    }
+
+    if (err) {
+      that.sessionClosedByServer = true;
+      // @ts-expect-error private accessor
+      that.server.channelzTrace.addTrace(
+        'CT_INFO',
+        'Connection dropped due to error of a ping frame ' +
+          err.message +
+          ' return in ' +
+          duration
+      );
+
+      this.close();
+    }
+  };
+
+  this.onPingTimeout = function onPingTimeout(this: http2.ServerHttp2Session) {
+    that.sessionClosedByServer = true;
+
+    // @ts-expect-error private accessor
+    that.server.channelzTrace.addTrace(
+      'CT_INFO',
+      'Connection dropped by keepalive timeout from ' + that.clientAddress
+    );
+
+    this.close();
+  };
 }
