@@ -1521,8 +1521,7 @@ export class Server {
     ctx.sessionClosedByServer = true;
 
     server.trace(
-      'Connection dropped by max connection age: ' +
-        session.socket?.remoteAddress
+      'Connection dropped by max connection age: ' + ctx.clientAddress
     );
 
     try {
@@ -1612,7 +1611,8 @@ export class Server {
       this.onIdleTimeout,
       this.sessionIdleTimeout,
       this,
-      session
+      session,
+      ctx
     );
     const idleTimeoutObj: SessionIdleTimeoutTracker = {
       activeStreams: 0,
@@ -1625,19 +1625,14 @@ export class Server {
 
     this.sessionIdleTimeouts.set(session, idleTimeoutObj);
 
-    const { socket } = session;
-    this.trace(
-      'Enable idle timeout for ' +
-        socket.remoteAddress +
-        ':' +
-        socket.remotePort
-    );
+    this.trace('Enable idle timeout for ' + ctx.clientAddress);
   }
 
   private onIdleTimeout(
-    this: undefined,
+    this: unknown,
     server: Server,
-    session: http2.ServerHttp2Session
+    session: http2.ServerHttp2Session,
+    ctx: SessionCtx
   ) {
     const sessionInfo = server.sessionIdleTimeouts.get(session);
 
@@ -1650,14 +1645,7 @@ export class Server {
       sessionInfo.activeStreams === 0 &&
       Date.now() - sessionInfo.lastIdle >= server.sessionIdleTimeout
     ) {
-      const { socket } = session;
-      server.trace(
-        'Session idle timeout triggered for ' +
-          socket?.remoteAddress +
-          ':' +
-          socket?.remotePort
-      );
-
+      server.trace('Session idle timeout triggered for ' + ctx.clientAddress);
       server.closeSession(session);
     }
   }
